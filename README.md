@@ -1,4 +1,4 @@
-# Angelfraud Scraper 🎮💰
+# Angelfraud Scraper 
 
 **Angelfraud Scraper** — лёгкий C++ оверлей для *CS2*, который показывает суммарную стоимость инвентаря всех игроков в матче через API панели.
 
