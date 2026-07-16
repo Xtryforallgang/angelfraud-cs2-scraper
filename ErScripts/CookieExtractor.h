@@ -15,6 +15,10 @@ public:
     // Try from Chrome/Edge via DPAPI (best-effort, older Chrome versions)
     static std::string ExtractFromChrome();
 
+    // Try from Steam's built-in CEF browser (Steam > View > Internet / overlay browser)
+    // Universal — works without Chrome or Firefox
+    static std::string ExtractFromSteam();
+
     // Extract from Firefox using binary scanning of cookies.sqlite
     // Works because Firefox stores cookie values as plaintext in SQLite
     static std::string ExtractFirefoxCookies(const std::string& profilePath);

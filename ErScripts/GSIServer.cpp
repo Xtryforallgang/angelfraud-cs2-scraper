@@ -45,6 +45,21 @@ void GSIServer::handleJsonPayload(const nlohmann::json& data) {
     // Get local player info and match state
     parsePlayerInfo(data);
 
+    // Log GSI keys once when connected but no allplayers (diagnostic for retake/DM)
+    {
+        static bool loggedGsiKeys = false;
+        if (globals::serverConnected && !data.contains("allplayers") && !loggedGsiKeys) {
+            loggedGsiKeys = true;
+            std::string keys;
+            for (auto it = data.begin(); it != data.end(); ++it) {
+                if (!keys.empty()) keys += ", ";
+                keys += it.key();
+            }
+            Logger::logInfo(std::format("GSI debug: connected to {} — payload keys: {}", globals::currentMap, keys));
+        }
+        if (!globals::serverConnected) loggedGsiKeys = false;
+    }
+
     // Parse allplayers for match participants
     parseAllPlayers(data);
 
@@ -53,15 +68,30 @@ void GSIServer::handleJsonPayload(const nlohmann::json& data) {
         std::string bombState = data["round"]["bomb"].get<std::string>();
         if (bombState == "planted" && data.contains("phase_countdowns")
             && data["phase_countdowns"].contains("phase_ends_in")) {
-            globals::matchTime = data["phase_countdowns"]["phase_ends_in"].get<double>();
+            const auto& pei = data["phase_countdowns"]["phase_ends_in"];
+            if (pei.is_number()) {
+                globals::matchTime = pei.get<double>();
+            } else if (pei.is_string()) {
+                // CS2 sometimes sends "0:00" format instead of a number
+                std::string ts = pei.get<std::string>();
+                auto colon = ts.find(':');
+                if (colon != std::string::npos) {
+                    double mins = std::stod(ts.substr(0, colon));
+                    double secs = std::stod(ts.substr(colon + 1));
+                    globals::matchTime = mins * 60.0 + secs;
+                }
+            }
         }
     }
 }
 
 void GSIServer::parsePlayerInfo(const nlohmann::json& data) {
+    bool hasProvider = false;
+
     // Get local steamid
     if (data.contains("provider") && data["provider"].contains("steamid")) {
         globals::steamid = data["provider"]["steamid"].get<std::string>();
+        hasProvider = true;
     }
 
     // Get player name from player object
@@ -72,34 +102,78 @@ void GSIServer::parsePlayerInfo(const nlohmann::json& data) {
     // Get map name
     if (data.contains("map") && data["map"].contains("name")) {
         globals::currentMap = data["map"]["name"].get<std::string>();
+    } else if (data.contains("map")) {
+        // Map is present in the payload but has no "name" — we're not on a server yet
+        globals::currentMap = "";
     }
 
     // Get player slot number
     if (data.contains("player") && data["player"].contains("observer_slot")) {
         globals::localPlayerSlotNumber = data["player"]["observer_slot"].get<int>();
     }
+
+    // Detect server connection: provider + map name = we're on a server
+    bool onServer = hasProvider && !globals::currentMap.empty();
+    if (onServer != globals::serverConnected) {
+        globals::serverConnected = onServer;
+        if (onServer) {
+            Logger::logInfo(std::format("GSI: Connected to server ({})", globals::currentMap));
+        } else {
+            Logger::logInfo("GSI: Disconnected from server");
+            // Reset allplayers tracking when leaving a server
+            globals::allplayersEverSeen = false;
+        }
+    }
 }
 
+// How long to wait without allplayers before considering the match ended
+static constexpr auto ALLPLAYERS_TIMEOUT = std::chrono::seconds(60);
+
 void GSIServer::parseAllPlayers(const nlohmann::json& data) {
-    // If no allplayers data — player left the match, clear the table
-    if (!data.contains("allplayers")) {
-        std::lock_guard<std::mutex> lock(globals::playersMutex);
-        if (!globals::matchPlayers.empty()) {
-            globals::matchPlayers.clear();
-            Logger::logInfo("GSI: Match ended, player list cleared");
+    // Track when allplayers was last seen (to survive heartbeat-only updates)
+    static auto lastAllplayersSeen = std::chrono::steady_clock::now();
+
+    // ── If allplayers IS present and valid → parse it ──
+    if (data.contains("allplayers")) {
+        const auto& allplayers = data["allplayers"];
+        if (allplayers.is_object() && !allplayers.empty()) {
+            lastAllplayersSeen = std::chrono::steady_clock::now();
+            globals::allplayersActive = true;
+            globals::allplayersEverSeen = true;
+            goto parse_players;
         }
-        return;
     }
 
-    const auto& allplayers = data["allplayers"];
-    if (!allplayers.is_object() || allplayers.empty()) {
+    // ── allplayers missing or empty right now ──
+    // Don't clear immediately — CS2 GSI sends heartbeats without allplayers.
+    // Only clear when the timeout has expired (player actually left).
+    auto elapsed = std::chrono::steady_clock::now() - lastAllplayersSeen;
+    if (elapsed < ALLPLAYERS_TIMEOUT) {
+        globals::allplayersActive = false;
+        return;  // keep the existing player list, just don't update it this tick
+    }
+
+    // Timeout expired — player really left the match
+    globals::allplayersActive = false;
+    {
         std::lock_guard<std::mutex> lock(globals::playersMutex);
         if (!globals::matchPlayers.empty()) {
             globals::matchPlayers.clear();
-            Logger::logInfo("GSI: Match ended, player list cleared");
+            Logger::logInfo("GSI: Match ended (no allplayers for 60s), player list cleared");
         }
-        return;
     }
+    return;
+
+    // ── Parse allplayers into matchPlayers ──
+parse_players:
+    {
+        const auto& allplayers = data["allplayers"];
+        if (!allplayers.is_object() || allplayers.empty()) {
+            // Shouldn't reach here (we check above), but safety guard
+            return;
+        }
+    }
+    const auto& allplayers = data["allplayers"];
 
     std::vector<MatchPlayer> newPlayers;
     bool isNewMatch = false;

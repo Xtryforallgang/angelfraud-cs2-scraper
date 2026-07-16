@@ -891,7 +891,14 @@ void Overlay::RenderPlayerList() noexcept {
         std::lock_guard<std::mutex> lock(globals::playersMutex);
         if (globals::matchPlayers.empty()) {
             ImGui::SetCursorScreenPos(ImVec2(pos.x + CONTENT_PAD + 4, ImGui::GetCursorScreenPos().y + 24.0f));
-            ImGui::TextColored(cGray2(0.45f), "Waiting for match data...");
+            if (globals::serverConnected && !globals::allplayersEverSeen) {
+                ImGui::TextColored(cGray2(0.45f), "Connected — no player list (retake/DM mode)");
+                ImGui::SetCursorScreenPos(ImVec2(pos.x + CONTENT_PAD + 4, ImGui::GetCursorScreenPos().y + 4));
+                if (!globals::steamid.empty())
+                    ImGui::TextColored(cGray1(0.35f), "Local: %s", globals::nickname.c_str());
+            } else {
+                ImGui::TextColored(cGray2(0.45f), "Waiting for match data...");
+            }
         } else {
             std::vector<MatchPlayer> sorted = globals::matchPlayers;
             std::sort(sorted.begin(), sorted.end(), [](const MatchPlayer& a, const MatchPlayer& b) {
@@ -917,7 +924,24 @@ void Overlay::RenderPlayerList() noexcept {
         else if (globals::matchPlayers.empty()) {
             auto elapsed = std::chrono::steady_clock::now() - globals::gsiLastUpdate;
             auto sec = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
-            if (sec < 10) ft = std::format("In match... waiting for players (GSI active, {}s ago)", sec);
+
+            if (!globals::serverConnected) {
+                // Not on any server — waiting for CS2 match
+                if (sec < 10) ft = std::format("Connecting to server... (GSI active, {}s ago)", sec);
+                else ft = "Waiting for CS2 match...";
+            }
+            else if (!globals::allplayersEverSeen) {
+                // Connected to a server, but allplayers never arrived
+                // This happens in retake, deathmatch, and community server modes
+                ft = std::format("[{}] Connected — no player data (retake/DM?)", globals::currentMap);
+            }
+            else if (sec < 10) {
+                // allplayers was seen but is temporarily absent (e.g. between rounds)
+                if (globals::allplayersActive)
+                    ft = std::format("In match... waiting for players (GSI active, {}s ago)", sec);
+                else
+                    ft = std::format("In match (allplayers inactive)... waiting for players");
+            }
             else ft = "Waiting for CS2 match...";
         }
         else ft = "Angelfraud-Scraper | CS2 Overlay by try0raw";

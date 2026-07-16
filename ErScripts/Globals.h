@@ -69,6 +69,9 @@ namespace globals {
     extern uint64_t matchId;            // to detect new match
     extern std::string currentMap;
     extern double matchTime;            // round time
+    extern bool allplayersActive;       // true when allplayers data is being received currently
+    extern bool allplayersEverSeen;     // true if allplayers was ever received this session
+    extern bool serverConnected;        // true when provider + map data indicates we're on a server
     extern std::chrono::steady_clock::time_point gsiLastUpdate;  // last GSI payload received
     extern std::atomic<bool> favNeedRefresh;                     // signal favorites window to refresh
 

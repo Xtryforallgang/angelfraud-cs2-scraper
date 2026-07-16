@@ -656,7 +656,7 @@ bool AngelfraudAPI::HttpPostDirect(const std::string& path, const std::string& b
 
 void AngelfraudAPI::WorkerLoop() {
     int checkCounter = 0;
-    const int MAX_CONCURRENT = 4;   // Up to 4 simultaneous requests
+    const int MAX_CONCURRENT = 1;   // 1 request at a time (rate limited to 1 per 5s)
 
     int profileCounter = 0;
 
@@ -733,9 +733,6 @@ void AngelfraudAPI::WorkerLoop() {
 
                 const std::string& sid = pendingIds[idx];
 
-                // Small stagger per thread to avoid request burst
-                std::this_thread::sleep_for(std::chrono::milliseconds(200 * (idx % MAX_CONCURRENT)));
-
                 double value = 0;
                 std::string status;
                 bool ok = FetchPrice(sid, value, status);
@@ -759,8 +756,8 @@ void AngelfraudAPI::WorkerLoop() {
                     }
                 }
 
-                // Per-thread rate limiting
-                std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+                // Per-thread rate limiting: 1 request per 5 seconds
+                std::this_thread::sleep_for(std::chrono::milliseconds(5000));
             }
         };
 

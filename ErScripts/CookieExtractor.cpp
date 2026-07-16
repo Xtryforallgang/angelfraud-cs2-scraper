@@ -599,20 +599,271 @@ std::string CookieExtractor::ExtractFromChrome() {
 }
 
 
+// ─── Steam CEF browser extraction ─────────────────────────────────────────────
+
+std::string CookieExtractor::ExtractFromSteam() {
+    // Steam CEF/WebView2 no longer stores htmlcache under the install directory.
+    // Modern Steam uses %LOCALAPPDATA%\Steam\htmlcache (full Chromium profile).
+    char* localAppData = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&localAppData, &len, "LOCALAPPDATA") != 0 || !localAppData) {
+        Logger::logInfo("CookieExtractor: LOCALAPPDATA not found");
+        return "";
+    }
+    std::string basePath(localAppData);
+    free(localAppData);
+
+    std::string cookieFile = basePath + "\\Steam\\htmlcache\\Default\\Network\\Cookies";
+    std::string localStatePath = basePath + "\\Steam\\htmlcache\\Local State";
+
+    if (!fs::exists(cookieFile)) {
+        Logger::logInfo(std::format("CookieExtractor: Steam cookie DB not found at {}", cookieFile));
+        return "";
+    }
+
+    Logger::logInfo("CookieExtractor: Found Steam CEF cookie DB, scanning for PHPSESSID...");
+
+    // ── Try to read the Local State for the DPAPI-wrapped AES key ──
+    DATA_BLOB aesKeyBlob = { 0, nullptr };
+    bool hasKey = false;
+
+    if (fs::exists(localStatePath)) {
+        std::ifstream lsFile(localStatePath);
+        if (lsFile.is_open()) {
+            try {
+                nlohmann::json ls;
+                lsFile >> ls;
+                lsFile.close();
+
+                std::string encKeyB64 = ls["os_crypt"]["encrypted_key"];
+                if (!encKeyB64.empty()) {
+                    DWORD decodedLen = 0;
+                    CryptStringToBinaryA(encKeyB64.c_str(), (DWORD)encKeyB64.size(),
+                        CRYPT_STRING_BASE64, nullptr, &decodedLen, nullptr, nullptr);
+                    if (decodedLen > 5) {
+                        std::vector<BYTE> decoded(decodedLen);
+                        CryptStringToBinaryA(encKeyB64.c_str(), (DWORD)encKeyB64.size(),
+                            CRYPT_STRING_BASE64, decoded.data(), &decodedLen, nullptr, nullptr);
+
+                        DATA_BLOB encryptedKey = { (DWORD)(decodedLen - 5), decoded.data() + 5 };
+                        if (CryptUnprotectData(&encryptedKey, nullptr, nullptr, nullptr,
+                            nullptr, 0, &aesKeyBlob)) {
+                            hasKey = (aesKeyBlob.cbData > 0);
+                            Logger::logInfo("CookieExtractor: Got Steam CEF decryption key from Local State");
+                        }
+                    }
+                }
+            }
+            catch (...) {
+                // JSON parse failed
+            }
+        }
+    }
+
+    // ── Open the cookie DB ──
+    // Steam's CEF process holds an exclusive lock on the Cookies file.
+    // Since the app runs as Administrator, FILE_FLAG_BACKUP_SEMANTICS bypasses this.
+    HANDLE hFile = CreateFileA(cookieFile.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, NULL);
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        // Fallback: try without backup semantics (in case not running as admin)
+        hFile = CreateFileA(cookieFile.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        if (hasKey) LocalFree(aesKeyBlob.pbData);
+        Logger::logWarning("CookieExtractor: Steam cookie DB is locked by the browser.");
+        Logger::logWarning("Close the Steam browser window (Steam > View > Internet) and try again.");
+        return "";
+    }
+
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) {
+        CloseHandle(hFile);
+        if (hasKey) LocalFree(aesKeyBlob.pbData);
+        return "";
+    }
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) {
+        CloseHandle(hFile);
+        if (hasKey) LocalFree(aesKeyBlob.pbData);
+        return "";
+    }
+
+    const BYTE* data = (const BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!data) {
+        CloseHandle(hMap); CloseHandle(hFile);
+        if (hasKey) LocalFree(aesKeyBlob.pbData);
+        return "";
+    }
+
+    std::string result;
+
+    // ── Search domain + PHPSESSID ──
+    {
+        std::string domain = cfg->angelfraudSiteUrl;
+        if (domain.find("https://") == 0) domain = domain.substr(8);
+        else if (domain.find("http://") == 0) domain = domain.substr(7);
+
+        std::vector<std::string> domainVariants = { domain };
+        if (domain.find("www.") == 0)
+            domainVariants.push_back(domain.substr(4));
+        else
+            domainVariants.push_back("www." + domain);
+        size_t dotPos = domain.find('.');
+        if (dotPos != std::string::npos) {
+            domainVariants.push_back(domain.substr(dotPos + 1));
+        }
+
+        for (const auto& dv : domainVariants) {
+            for (size_t pos = 0; pos + dv.size() <= (size_t)fileSize; pos++) {
+                bool domainMatch = true;
+                for (size_t i = 0; i < dv.size(); i++) {
+                    if ((data[pos + i] | 0x20) != (BYTE)(dv[i] | 0x20)) {
+                        domainMatch = false;
+                        break;
+                    }
+                }
+                if (!domainMatch) continue;
+
+                // Found domain — search backward for "phpsessid"
+                size_t searchStart = (pos > 2048) ? pos - 2048 : 0;
+                size_t namePos = SIZE_MAX;
+                for (size_t sp = searchStart; sp < pos; sp++) {
+                    bool nameMatch = true;
+                    for (int i = 0; i < 9; i++) {
+                        if ((data[sp + i] | 0x20) != (BYTE)"phpsessid"[i]) {
+                            nameMatch = false;
+                            break;
+                        }
+                    }
+                    if (nameMatch) { namePos = sp; break; }
+                }
+                if (namePos == SIZE_MAX) continue;
+
+                // Try AES-GCM decryption (newer Steam CEF, same as Chrome)
+                if (hasKey) {
+                    Logger::logInfo("CookieExtractor: Trying AES-GCM decrypt for Steam PHPSESSID");
+                    result = FindAndDecryptChromeCookie(data, (size_t)fileSize,
+                        namePos + 9, 1024,
+                        std::vector<BYTE>(aesKeyBlob.pbData, aesKeyBlob.pbData + aesKeyBlob.cbData));
+                    if (!result.empty()) {
+                        Logger::logSuccess("CookieExtractor: Found PHPSESSID in Steam CEF cookies (AES-GCM)");
+                    }
+
+                    // Also try cf_clearance
+                    if (!result.empty() && extractedCfClearance.empty()) {
+                        for (size_t cfp = namePos + 9; cfp < pos + 512 && cfp + 12 <= (size_t)fileSize; cfp++) {
+                            bool cfMatch = true;
+                            for (int i = 0; i < 12; i++) {
+                                if ((data[cfp + i] | 0x20) != (BYTE)"cf_clearance"[i]) {
+                                    cfMatch = false; break;
+                                }
+                            }
+                            if (cfMatch) {
+                                std::string cfVal = FindAndDecryptChromeCookie(data, (size_t)fileSize,
+                                    cfp + 12, 512,
+                                    std::vector<BYTE>(aesKeyBlob.pbData, aesKeyBlob.pbData + aesKeyBlob.cbData));
+                                if (!cfVal.empty()) {
+                                    extractedCfClearance = cfVal;
+                                    Logger::logInfo(std::format("CookieExtractor: Found cf_clearance in Steam CEF cookies ({} chars)", cfVal.size()));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: binary scan for plaintext (older CEF / non-encrypted)
+                if (result.empty()) {
+                    Logger::logInfo("CookieExtractor: Trying binary scan for plaintext Steam cookies");
+                    for (size_t bp = searchStart; bp < pos; bp++) {
+                        bool isPhpsessid = true;
+                        for (int j = 0; j < 9; j++) {
+                            if ((data[bp + j] | 0x20) != (BYTE)"phpsessid"[j]) {
+                                isPhpsessid = false; break;
+                            }
+                        }
+                        if (!isPhpsessid) continue;
+
+                        size_t valueStart = bp + 9;
+                        while (valueStart < pos && !isalnum((unsigned char)data[valueStart])) {
+                            valueStart++;
+                        }
+
+                        size_t scan = valueStart;
+                        size_t valLen = 0;
+                        while (scan < pos && (isalnum((unsigned char)data[scan]) ||
+                            data[scan] == '-' || data[scan] == '_')) {
+                            valLen++;
+                            scan++;
+                            if (valLen > 40) break;
+                        }
+
+                        if (valLen < 26 || valLen > 40) continue;
+
+                        std::string candidate((const char*)data + valueStart, valLen);
+                        bool valid = true;
+                        for (char c : candidate) {
+                            if (!isalnum((unsigned char)c) && c != '-' && c != '_') {
+                                valid = false; break;
+                            }
+                        }
+                        if (!valid) continue;
+
+                        result = candidate;
+                        Logger::logSuccess("CookieExtractor: Found PHPSESSID in Steam CEF cookies (plaintext)");
+                        break;
+                    }
+                }
+
+                if (!result.empty()) break;
+            }
+            if (!result.empty()) break;
+        }
+    }
+
+    // Cleanup
+    UnmapViewOfFile((LPCVOID)data);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+    if (hasKey) LocalFree(aesKeyBlob.pbData);
+
+    if (!result.empty()) {
+        Logger::logSuccess("CookieExtractor: Successfully extracted PHPSESSID from Steam browser");
+    } else {
+        Logger::logInfo("CookieExtractor: No PHPSESSID found in Steam CEF cookies");
+        Logger::logInfo("Make sure you are logged into the panel in Steam's built-in browser (Steam > View > Internet)");
+    }
+
+    return result;
+}
+
 // ─── Main extraction entry point ─────────────────────────────────────────────
 
 std::string CookieExtractor::Extract() {
     // Reset cf_clearance at start of each extraction
     extractedCfClearance.clear();
 
-    // Try Firefox first (most reliable, plaintext cookies)
-    std::string phpsessid = ExtractFromFirefox();
+    // Try Steam's built-in browser first — universal for CS2 players,
+    // works on Windows 10 where Chrome cookie decryption may fail
+    std::string phpsessid = ExtractFromSteam();
     if (!phpsessid.empty()) return phpsessid;
 
-    // Try Chrome/Edge
+    // Try Firefox (plaintext cookies, reliable)
+    phpsessid = ExtractFromFirefox();
+    if (!phpsessid.empty()) return phpsessid;
+
+    // Try Chrome/Edge/Brave/Opera/Vivaldi/Yandex
     phpsessid = ExtractFromChrome();
     if (!phpsessid.empty()) return phpsessid;
 
     Logger::logWarning("CookieExtractor: Could not find PHPSESSID in any browser");
+    Logger::logInfo("Tip: Open the panel website in Steam's built-in browser (Steam > View > Internet)");
     return "";
 }

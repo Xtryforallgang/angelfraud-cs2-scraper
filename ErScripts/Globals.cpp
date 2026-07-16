@@ -16,6 +16,9 @@ namespace globals {
     uint64_t matchId = 0;
     std::string currentMap = "";
     double matchTime = 0.0;
+    bool allplayersActive = false;
+    bool allplayersEverSeen = false;
+    bool serverConnected = false;
     std::chrono::steady_clock::time_point gsiLastUpdate = {};
     std::atomic<bool> favNeedRefresh{ false };
 

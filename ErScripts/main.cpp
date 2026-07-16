@@ -7,9 +7,9 @@
 #include "AngelfraudAPI.h"
 #include "CookieExtractor.h"
 
-// Windows subsystem — no console window
-#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
-#pragma comment(linker, "/ENTRY:mainCRTStartup")
+// Console subsystem — show console for logs
+//#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
+//#pragma comment(linker, "/ENTRY:mainCRTStartup")
 
 #include <iostream>
 #include <thread>
@@ -115,6 +115,9 @@ bool EnsureGSIConfig(const std::wstring& gsiConfigPath) {
 
 int main() {
     Logger::EnableANSIColors();
+
+    // Init file logging to desktop (captures all log output in case of crash)
+    Logger::InitFileLog("erscripts_log.txt");
 
     // Single instance check
     CreateMutexA(0, FALSE, "Local\\csinventory_overlay");
